@@ -1061,7 +1061,7 @@ Return ONLY a valid JSON object without markdown code blocks:
     // GEMINI REST API FETCH WITH EXPONENTIAL BACKOFF (STATUS 429 AUTO RETRY)
     // =========================================================================
     async function fetchGeminiWithRetry(geminiKey, requestBody, maxRetries = 3, retryDelayMs = 6000) {
-      const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+      const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'];
       let lastError = null;
 
       for (let model of models) {
@@ -1076,28 +1076,30 @@ Return ONLY a valid JSON object without markdown code blocks:
             });
 
             if (response.status === 429) {
-              addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${(retryDelayMs / 1000)}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
+              addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit on ${model}. Auto-retrying in ${(retryDelayMs / 1000)}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
               await new Promise(r => setTimeout(r, retryDelayMs));
               continue;
             }
 
             if (!response.ok) {
               const errText = await response.text();
+              lastError = new Error(`HTTP ${response.status}: ${errText}`);
               if (response.status === 404 || errText.includes('not found') || errText.includes('INVALID_ARGUMENT')) {
-                lastError = new Error(`HTTP ${response.status}: ${errText}`);
-                break; // Try fallback model
+                break; // Skip to next model immediately
               }
-              throw new Error(`Gemini API returned status ${response.status}: ${errText}`);
+              throw lastError;
             }
 
             return await response.json();
           } catch (err) {
             lastError = err;
             if (err.message && err.message.includes('429')) {
-              addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${(retryDelayMs / 1000)}s...`, 'WARN');
-              await new Promise(r => setTimeout(r, retryDelayMs));
-            } else if (attempt === maxRetries) {
-              break;
+              if (attempt < maxRetries) {
+                addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${(retryDelayMs / 1000)}s...`, 'WARN');
+                await new Promise(r => setTimeout(r, retryDelayMs));
+              }
+            } else {
+              break; // Skip retries for non-429 errors
             }
           }
         }
