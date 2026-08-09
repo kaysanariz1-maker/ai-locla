@@ -200,12 +200,13 @@ export default function App() {
 
   const lastUserQueryRef = useRef<number>(0);
 
-  const fetchGeminiWithRetry = async (geminiKey: string, requestBody: any, maxRetries = 3, retryDelayMs = 6000) => {
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+  const fetchGeminiWithRetry = async (geminiKey: string, requestBody: any, maxRetries = 3) => {
+    const models = ['gemini-1.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-pro'];
     let lastError: any = null;
 
     for (const model of models) {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+      let delayMs = 3000;
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -216,27 +217,31 @@ export default function App() {
           });
 
           if (response.status === 429) {
-            addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit on ${model}. Auto-retrying in ${retryDelayMs / 1000}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
-            await new Promise((r) => setTimeout(r, retryDelayMs));
+            addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit on ${model}. Retrying in ${delayMs / 1000}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
+            await new Promise((r) => setTimeout(r, delayMs));
+            delayMs *= 2; // Exponential backoff (3s -> 6s -> 12s)
             continue;
           }
 
+          const data = await response.json();
+
           if (!response.ok) {
-            const errText = await response.text();
+            const errText = JSON.stringify(data);
             lastError = new Error(`HTTP ${response.status}: ${errText}`);
             if (response.status === 404 || errText.includes('not found') || errText.includes('INVALID_ARGUMENT')) {
-              break; // Skip to next model immediately
+              break; // Skip to next model immediately on 404
             }
             throw lastError;
           }
 
-          return await response.json();
+          return data;
         } catch (err: any) {
           lastError = err;
           if (err.message && err.message.includes('429')) {
             if (attempt < maxRetries) {
-              addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${retryDelayMs / 1000}s...`, 'WARN');
-              await new Promise((r) => setTimeout(r, retryDelayMs));
+              addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Retrying in ${delayMs / 1000}s...`, 'WARN');
+              await new Promise((r) => setTimeout(r, delayMs));
+              delayMs *= 2;
             }
           } else {
             break; // Skip retries for non-429 errors
@@ -245,7 +250,7 @@ export default function App() {
       }
     }
 
-    throw lastError || new Error('Gemini API request failed across models.');
+    throw lastError || new Error('Gemini API request failed.');
   };
 
   const handleUserQuery = async (queryText: string) => {
