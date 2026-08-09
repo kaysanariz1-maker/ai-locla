@@ -562,8 +562,8 @@ Return ONLY a valid JSON object without markdown code blocks:
     // Default ElevenLabs Adam Voice ID
     const DEFAULT_ADAM_VOICE_ID = 'pNInz6obpgDQGcFmaJgB';
 
-    // ── Toggle this to false when testing purely on your laptop ──
-    const USE_ESP32_HARDWARE = false;
+    // Global Hardware Configuration Constant (Laptop Simulation Mode)
+    const HARDWARE_MODE = { USE_ESP32: false };
 
     // State Variables
     let isListening = false;
@@ -573,6 +573,11 @@ Return ONLY a valid JSON object without markdown code blocks:
     let conversationHistory = []; // Global conversation memory array
     let currentCameraStream = null;
     let cameraMode = 'laptop'; // 'laptop', 'esp32', 'disabled'
+
+    // Rate Limiter & Throttling Variables
+    let lastUserQueryTimestamp = 0;
+    let lastCameraSnapshotTimestamp = 0;
+    let explicitCameraCaptureRequested = false;
 
     // Local Storage Keys
     const STORAGE = {
@@ -675,8 +680,9 @@ Return ONLY a valid JSON object without markdown code blocks:
       // Test Snapshot Capture
       if (btnManualCapture) {
         btnManualCapture.addEventListener('click', async () => {
-          addLogEntry('VISION_TEST', 'Testing camera frame snapshot capture...', 'INFO');
-          const frameData = await getActiveCameraFrameBase64();
+          addLogEntry('VISION_TEST', 'Testing camera frame snapshot capture (Explicit Trigger)...', 'INFO');
+          explicitCameraCaptureRequested = true;
+          const frameData = await getActiveCameraFrameBase64(true);
           if (frameData) {
             addLogEntry('VISION_SUCCESS', `Successfully captured camera frame (${Math.round(frameData.length / 1024)} KB base64 data).`, 'SUCCESS');
           } else {
@@ -846,38 +852,49 @@ Return ONLY a valid JSON object without markdown code blocks:
       }
     }
 
-    async function getActiveCameraFrameBase64() {
+    async function getActiveCameraFrameBase64(isExplicitTrigger = false) {
+      const now = Date.now();
+      if (!isExplicitTrigger && (now - lastCameraSnapshotTimestamp < 10000)) {
+        // Skip automatic snapshot to prevent spamming vision tokens (min 10s interval)
+        return null;
+      }
+
+      let frameData = null;
       if (cameraMode === 'laptop' && camVideo && !camVideo.classList.contains('hidden') && camVideo.readyState >= 2) {
         try {
           const ctx = camCanvas.getContext('2d');
           camCanvas.width = camVideo.videoWidth || 640;
           camCanvas.height = camVideo.videoHeight || 480;
           ctx.drawImage(camVideo, 0, 0, camCanvas.width, camCanvas.height);
-          return camCanvas.toDataURL('image/jpeg', 0.8);
+          frameData = camCanvas.toDataURL('image/jpeg', 0.8);
         } catch (e) {
           console.warn('Canvas export failed:', e);
-          return null;
         }
       } else if (cameraMode === 'esp32') {
         const espIp = cfgEsp32Ip.value.trim() || localStorage.getItem(STORAGE.ESP32_IP);
-        if (!espIp) return null;
-        try {
-          const captureUrl = `http://${espIp}/capture`;
-          const res = await fetch(captureUrl, { mode: 'cors' });
-          if (res.ok) {
-            const blob = await res.blob();
-            return new Promise((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result);
-              reader.onerror = () => resolve(null);
-              reader.readAsDataURL(blob);
-            });
+        if (espIp) {
+          try {
+            const captureUrl = `http://${espIp}/capture`;
+            const res = await fetch(captureUrl, { mode: 'cors' });
+            if (res.ok) {
+              const blob = await res.blob();
+              frameData = await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => resolve(null);
+                reader.readAsDataURL(blob);
+              });
+            }
+          } catch (e) {
+            console.warn('ESP32 frame capture exception:', e);
           }
-        } catch (e) {
-          console.warn('ESP32 frame capture exception:', e);
         }
       }
-      return null;
+
+      if (frameData) {
+        lastCameraSnapshotTimestamp = Date.now();
+      }
+      return frameData;
     }
 
     // Update status badges in top right
@@ -1041,6 +1058,55 @@ Return ONLY a valid JSON object without markdown code blocks:
     }
 
     // =========================================================================
+    // GEMINI REST API FETCH WITH EXPONENTIAL BACKOFF (STATUS 429 AUTO RETRY)
+    // =========================================================================
+    async function fetchGeminiWithRetry(geminiKey, requestBody, maxRetries = 3, retryDelayMs = 6000) {
+      const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+      let lastError = null;
+
+      for (let model of models) {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          try {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(requestBody)
+            });
+
+            if (response.status === 429) {
+              addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${(retryDelayMs / 1000)}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
+              await new Promise(r => setTimeout(r, retryDelayMs));
+              continue;
+            }
+
+            if (!response.ok) {
+              const errText = await response.text();
+              if (response.status === 404 || errText.includes('not found') || errText.includes('INVALID_ARGUMENT')) {
+                lastError = new Error(`HTTP ${response.status}: ${errText}`);
+                break; // Try fallback model
+              }
+              throw new Error(`Gemini API returned status ${response.status}: ${errText}`);
+            }
+
+            return await response.json();
+          } catch (err) {
+            lastError = err;
+            if (err.message && err.message.includes('429')) {
+              addLogEntry('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${(retryDelayMs / 1000)}s...`, 'WARN');
+              await new Promise(r => setTimeout(r, retryDelayMs));
+            } else if (attempt === maxRetries) {
+              break;
+            }
+          }
+        }
+      }
+
+      throw lastError || new Error('Gemini API request failed across models.');
+    }
+
+    // =========================================================================
     // CORE ORCHESTRATION: PROCESS USER QUERY (GEMINI API)
     // =========================================================================
     async function processUserQuery(userTranscript) {
@@ -1060,24 +1126,34 @@ Return ONLY a valid JSON object without markdown code blocks:
         return;
       }
 
+      // Client-side Request Throttle (min 5,000ms between queries to protect Free Tier RPM)
+      const timeSinceLastQuery = Date.now() - lastUserQueryTimestamp;
+      if (timeSinceLastQuery < 5000) {
+        const waitMs = 5000 - timeSinceLastQuery;
+        addLogEntry('THROTTLE', `Enforcing 5s query delay for Free Tier. Waiting ${(waitMs / 1000).toFixed(1)}s...`, 'INFO');
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      lastUserQueryTimestamp = Date.now();
+
       setSystemState('Gemini Thinking...');
       
-      // Grab active camera frame for multimodal vision context
-      const cameraFrameBase64 = await getActiveCameraFrameBase64();
+      // Grab camera frame checking explicit trigger or 10s minimum interval
+      const isExplicit = explicitCameraCaptureRequested;
+      explicitCameraCaptureRequested = false;
+      const cameraFrameBase64 = await getActiveCameraFrameBase64(isExplicit);
+      
       if (cameraFrameBase64) {
-        addLogEntry('VISION_CAPTURE', 'Captured current camera frame & attached to Gemini prompt.', 'INFO');
+        addLogEntry('VISION_CAPTURE', 'Captured camera frame (throttled 10s min interval) & attached to Gemini prompt.', 'INFO');
       }
 
       addLogEntry('GEMINI_REQ', `Query: "${userTranscript}" (History length: ${conversationHistory.length} messages, Vision: ${cameraFrameBase64 ? 'Yes' : 'No'})`, 'INFO');
 
-      // If no Gemini API key provided, fallback to client local Gemini mock logic
       if (!geminiKey) {
         addLogEntry('GEMINI_KEY_MISSING', 'No Gemini API Key set. Generating simulated Gemini AI response...', 'WARN');
         await new Promise(r => setTimeout(r, 800));
         
         const fallbackResponse = generateLocalFallbackResponse(userTranscript);
         
-        // Append turn to history
         conversationHistory.push({ role: 'user', content: userTranscript });
         conversationHistory.push({ role: 'assistant', content: JSON.stringify(fallbackResponse) });
         if (conversationHistory.length > 8) {
@@ -1089,9 +1165,7 @@ Return ONLY a valid JSON object without markdown code blocks:
         return;
       }
 
-      // Send to Google Gemini API via official REST API endpoint with conversation memory & vision
       try {
-        // Build conversation contents (history + current user turn)
         const contents = [
           ...conversationHistory.map(msg => ({
             role: msg.role === 'assistant' ? 'model' : 'user',
@@ -1123,34 +1197,16 @@ Return ONLY a valid JSON object without markdown code blocks:
           },
           contents: contents,
           generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 500
+            temperature: 0.7,
+            maxOutputTokens: 800
           }
         };
 
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(requestBody)
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          if (response.status === 429 || errText.includes('429') || errText.includes('RESOURCE_EXHAUSTED') || errText.includes('quota')) {
-            alert("Gemini quota exceeded. Please wait a minute or enter a new API key.");
-            addLogEntry('GEMINI_429', 'Gemini quota exceeded (429 Resource Exhausted).', 'ERROR');
-          }
-          throw new Error(`Gemini API returned status ${response.status}: ${errText}`);
-        }
-
-        const data = await response.json();
+        const data = await fetchGeminiWithRetry(geminiKey, requestBody, 3, 6000);
         const rawContent = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
         
         addLogEntry('GEMINI_RAW_RESP', rawContent, 'DEBUG');
 
-        // Parse JSON response safely
         let parsedData;
         try {
           let cleanJson = rawContent;
@@ -1167,7 +1223,6 @@ Return ONLY a valid JSON object without markdown code blocks:
           };
         }
 
-        // Save turn in history (using text portion for history representation, capped to 4 turns / 8 items)
         conversationHistory.push({ role: 'user', content: userTranscript });
         conversationHistory.push({ role: 'assistant', content: rawContent });
         if (conversationHistory.length > 8) {
@@ -1181,14 +1236,8 @@ Return ONLY a valid JSON object without markdown code blocks:
         console.error('Gemini API Error:', err);
         addLogEntry('GEMINI_ERROR', err.message, 'ERROR');
 
-        if (err.message && (err.message.includes('429') || err.message.includes('quota') || err.message.includes('RESOURCE_EXHAUSTED'))) {
-          alert("Gemini quota exceeded. Please wait a minute or enter a new API key.");
-        }
-
-        // Graceful fallback response
         const fallback = generateLocalFallbackResponse(userTranscript);
 
-        // Save turn in history (capped to 4 turns / 8 items)
         conversationHistory.push({ role: 'user', content: userTranscript });
         conversationHistory.push({ role: 'assistant', content: JSON.stringify(fallback) });
         if (conversationHistory.length > 8) {
@@ -1222,10 +1271,10 @@ Return ONLY a valid JSON object without markdown code blocks:
     // ESP32 NON-BLOCKING HARDWARE CALL (1.5s TIMEOUT)
     // =========================================================================
     async function sendMoveToESP32(robotAction) {
-      // ── SIMULATION MODE: skip real HTTP request when hardware is disconnected ──
-      if (!USE_ESP32_HARDWARE) {
-        console.log(`[SIMULATION MODE] Executing action UI animation: [${robotAction}]`);
-        addLogEntry('SIMULATED_ACTION', `[Laptop Mode] Robot action simulated: ${robotAction} (ESP32 hardware disabled)`, 'INFO');
+      // ── LAPTOP SIMULATION MODE: Bypass network fetches when ESP32 is offline ──
+      if (!HARDWARE_MODE.USE_ESP32) {
+        console.log(`[SIMULATION] Executed command: [${robotAction}]`);
+        addLogEntry('SIMULATION', `[SIMULATION] Executed command: [${robotAction}]`, 'INFO');
         return;
       }
 

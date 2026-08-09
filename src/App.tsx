@@ -29,8 +29,8 @@ Return ONLY a valid JSON object without markdown code blocks:
 
 const DEFAULT_ADAM_VOICE_ID = 'pNInz6obpgDQGcFmaJgB';
 
-// Toggle this to false when testing purely on your laptop (no ESP32 connected)
-const USE_ESP32_HARDWARE = false;
+// Global Hardware Configuration Constant (Laptop Simulation Mode)
+const HARDWARE_MODE = { USE_ESP32: false };
 
 const STORAGE_KEYS = {
   GEMINI_KEY: 'tararbari_gemini_key',
@@ -161,10 +161,10 @@ export default function App() {
   };
 
   const sendMoveToESP32 = async (action: RobotAction) => {
-    // SIMULATION MODE: skip real HTTP request when hardware is disconnected
-    if (!USE_ESP32_HARDWARE) {
-      console.log(`[SIMULATION MODE] Executing action UI animation: [${action}]`);
-      addLog('SIMULATED_ACTION', `[Laptop Mode] Robot action simulated: ${action} (ESP32 hardware disabled)`, 'INFO');
+    // LAPTOP SIMULATION MODE: Bypass network fetches when ESP32 is offline
+    if (!HARDWARE_MODE.USE_ESP32) {
+      console.log(`[SIMULATION] Executed command: [${action}]`);
+      addLog('SIMULATION', `[SIMULATION] Executed command: [${action}]`, 'INFO');
       return;
     }
 
@@ -198,11 +198,68 @@ export default function App() {
     }
   };
 
+  const lastUserQueryRef = useRef<number>(0);
+
+  const fetchGeminiWithRetry = async (geminiKey: string, requestBody: any, maxRetries = 3, retryDelayMs = 6000) => {
+    const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+    let lastError: any = null;
+
+    for (const model of models) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody),
+          });
+
+          if (response.status === 429) {
+            addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${retryDelayMs / 1000}s... (Attempt ${attempt}/${maxRetries})`, 'WARN');
+            await new Promise((r) => setTimeout(r, retryDelayMs));
+            continue;
+          }
+
+          if (!response.ok) {
+            const errText = await response.text();
+            if (response.status === 404 || errText.includes('not found') || errText.includes('INVALID_ARGUMENT')) {
+              lastError = new Error(`HTTP ${response.status}: ${errText}`);
+              break;
+            }
+            throw new Error(`Gemini API returned status ${response.status}: ${errText}`);
+          }
+
+          return await response.json();
+        } catch (err: any) {
+          lastError = err;
+          if (err.message && err.message.includes('429')) {
+            addLog('QUOTA_LIMIT', `[QUOTA_LIMIT] Rate limit hit. Auto-retrying in ${retryDelayMs / 1000}s...`, 'WARN');
+            await new Promise((r) => setTimeout(r, retryDelayMs));
+          } else if (attempt === maxRetries) {
+            break;
+          }
+        }
+      }
+    }
+
+    throw lastError || new Error('Gemini API request failed across models.');
+  };
+
   const handleUserQuery = async (queryText: string) => {
     if (isListening && recognitionRef.current) {
       recognitionRef.current.stop();
       setIsListening(false);
     }
+
+    // Client-side Request Throttle (min 5,000ms delay between consecutive user queries)
+    const timeSinceLastQuery = Date.now() - lastUserQueryRef.current;
+    if (timeSinceLastQuery < 5000) {
+      const waitMs = 5000 - timeSinceLastQuery;
+      addLog('THROTTLE', `Enforcing 5s query delay for Free Tier. Waiting ${(waitMs / 1000).toFixed(1)}s...`, 'INFO');
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    lastUserQueryRef.current = Date.now();
 
     setRobotState('Gemini Thinking...');
     addLog('GEMINI_REQ', `Query: "${queryText}" (Memory: ${conversationHistory.length} messages)`, 'INFO');
@@ -222,7 +279,6 @@ export default function App() {
       return;
     }
 
-    // Call Google Gemini official REST endpoint with conversation history
     try {
       const contents = conversationHistory.map((msg) => ({
         role: msg.role === 'assistant' ? 'model' : 'user',
@@ -240,29 +296,12 @@ export default function App() {
         },
         contents: contents,
         generationConfig: {
-          temperature: 0.3,
-          response_mime_type: 'application/json',
+          temperature: 0.7,
+          maxOutputTokens: 800,
         },
       };
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${config.geminiKey}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
-      });
-
-      if (!response.ok) {
-        const errBody = await response.text();
-        if (response.status === 429 || errBody.includes('429') || errBody.includes('RESOURCE_EXHAUSTED') || errBody.includes('quota')) {
-          alert("Gemini quota exceeded. Please wait a minute or enter a new API key.");
-          addLog('GEMINI_429', 'Gemini quota exceeded (429 Resource Exhausted).', 'ERROR');
-        }
-        throw new Error(`HTTP ${response.status}: ${errBody}`);
-      }
-
-      const data = await response.json();
+      const data = await fetchGeminiWithRetry(config.geminiKey, requestBody, 3, 6000);
       const rawContent = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
       addLog('GEMINI_RAW_RESP', rawContent, 'DEBUG');
 
@@ -290,10 +329,6 @@ export default function App() {
     } catch (err: any) {
       console.error('Gemini API Error:', err);
       addLog('GEMINI_ERROR', err.message, 'ERROR');
-
-      if (err.message && (err.message.includes('429') || err.message.includes('quota') || err.message.includes('RESOURCE_EXHAUSTED'))) {
-        alert("Gemini quota exceeded. Please wait a minute or enter a new API key.");
-      }
 
       const fallback = getLocalFallback(queryText);
 
